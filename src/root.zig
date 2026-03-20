@@ -18,6 +18,11 @@ pub const heap = @import("heap.zig");
 pub const arena = @import("arena.zig");
 pub const stats = @import("stats.zig");
 
+// Stress tests (test-only)
+test {
+    _ = @import("tests.zig");
+}
+
 // Re-export commonly used items
 pub const PAGE_SIZE = config.PAGE_SIZE;
 pub const SEGMENT_SIZE = config.SEGMENT_SIZE;
