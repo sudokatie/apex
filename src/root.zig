@@ -14,7 +14,7 @@ pub const page = @import("page.zig");
 pub const slab = @import("slab.zig");
 pub const large = @import("large.zig");
 pub const thread_cache = @import("thread_cache.zig");
-// pub const heap = @import("heap.zig");
+pub const heap = @import("heap.zig");
 // pub const arena = @import("arena.zig");
 // pub const stats = @import("stats.zig");
 
