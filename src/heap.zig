@@ -73,10 +73,46 @@ pub const Heap = struct {
 
     // Allocation with alignment
     pub fn allocAligned(self: *Self, size: usize, alignment: usize) ?[*]u8 {
-        // For now, rely on natural alignment from size classes
-        // TODO: proper aligned allocation
-        _ = alignment;
-        return self.alloc(size);
+        if (size == 0) return null;
+        if (alignment == 0 or alignment > config.PAGE_SIZE) return null;
+
+        // Check if alignment is power of 2
+        if ((alignment & (alignment - 1)) != 0) return null;
+
+        // For small alignments (<= 16), size classes provide natural alignment
+        if (alignment <= 16) {
+            return self.alloc(size);
+        }
+
+        // For larger alignments, over-allocate and align within the block
+        // We need extra space: alignment - 1 for adjustment + sizeof(usize) for storing original ptr
+        const header_size = @sizeOf(usize);
+        const extra = alignment - 1 + header_size;
+        const total_size = size + extra;
+
+        const raw_ptr = self.alloc(total_size) orelse return null;
+
+        // Calculate aligned address (leave room for header)
+        const raw_addr = @intFromPtr(raw_ptr);
+        const aligned_addr = (raw_addr + header_size + alignment - 1) & ~(alignment - 1);
+        const aligned_ptr: [*]u8 = @ptrFromInt(aligned_addr);
+
+        // Store original pointer just before aligned address
+        const header_ptr: *[*]u8 = @ptrFromInt(aligned_addr - header_size);
+        header_ptr.* = raw_ptr;
+
+        return aligned_ptr;
+    }
+
+    // Free aligned allocation (use when allocAligned was used with alignment > 16)
+    pub fn freeAligned(self: *Self, ptr: ?[*]u8) void {
+        const p = ptr orelse return;
+
+        // Retrieve original pointer from header
+        const header_ptr: *[*]u8 = @ptrFromInt(@intFromPtr(p) - @sizeOf(usize));
+        const original_ptr = header_ptr.*;
+
+        self.free(original_ptr);
     }
 
     // Free memory
