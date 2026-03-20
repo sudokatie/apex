@@ -16,7 +16,7 @@ pub const large = @import("large.zig");
 pub const thread_cache = @import("thread_cache.zig");
 pub const heap = @import("heap.zig");
 pub const arena = @import("arena.zig");
-// pub const stats = @import("stats.zig");
+pub const stats = @import("stats.zig");
 
 // Re-export commonly used items
 pub const PAGE_SIZE = config.PAGE_SIZE;
