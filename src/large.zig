@@ -108,18 +108,19 @@ pub const LargeAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        // Get a segment with enough free pages
+        // Get a segment with enough contiguous free pages
         const seg = self.segment_cache.acquire() orelse return null;
 
-        // For now, allocate single page for simplicity
-        // TODO: support multi-page allocations
-        const page_idx = seg.allocPage() orelse {
+        // Allocate contiguous pages
+        const page_count: u5 = @intCast(pages_needed);
+        const page_idx = seg.allocPages(page_count) orelse {
             self.segment_cache.release(seg);
             return null;
         };
 
+        // Initialize the first page with the page count
         const page: *Page = @ptrCast(@alignCast(seg.pageAddress(page_idx)));
-        page.initLarge(seg, page_idx);
+        page.initLarge(seg, page_idx, @intCast(pages_needed));
 
         return page.dataStart();
     }
@@ -170,7 +171,10 @@ pub const LargeAllocator = struct {
         defer self.lock.unlock();
 
         const seg = page.segment;
-        seg.freePage(page.index);
+        const page_count = page.page_count;
+
+        // Free all contiguous pages
+        seg.freePages(page.index, @intCast(page_count));
 
         // If segment is empty, return to cache
         if (seg.isEmpty()) {

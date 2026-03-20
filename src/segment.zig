@@ -78,6 +78,75 @@ pub const Segment = struct {
         return free_bit;
     }
 
+    // Allocate multiple contiguous pages from this segment
+    // Returns starting page index or null if not enough contiguous pages
+    pub fn allocPages(self: *Self, count: u5) ?u5 {
+        if (count == 0) return null;
+        if (count == 1) return self.allocPage();
+        if (count > 31) return null; // Max 31 pages (page 0 is header)
+
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const bitmap = self.page_bitmap.load(.acquire);
+
+        // Find 'count' contiguous free bits
+        const start_idx = findContiguousFree(bitmap, count) orelse return null;
+
+        // Create mask for all pages to allocate
+        var mask: u32 = 0;
+        var i: u5 = 0;
+        while (i < count) : (i += 1) {
+            mask |= @as(u32, 1) << (start_idx + i);
+        }
+
+        // Set all bits
+        const new_bitmap = bitmap | mask;
+        self.page_bitmap.store(new_bitmap, .release);
+
+        _ = self.allocated_pages.fetchAdd(count, .monotonic);
+
+        return start_idx;
+    }
+
+    // Free multiple contiguous pages starting at index
+    pub fn freePages(self: *Self, start_index: u5, count: u5) void {
+        if (start_index == 0) return; // Never free the header page
+        if (count == 0) return;
+
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const bitmap = self.page_bitmap.load(.acquire);
+
+        // Create mask for pages to free
+        var mask: u32 = 0;
+        var freed: u32 = 0;
+        var i: u5 = 0;
+        while (i < count) : (i += 1) {
+            const idx = start_index + i;
+            if (idx >= 32) break;
+            if (idx == 0) continue; // Skip header page
+            const bit = @as(u32, 1) << idx;
+            if (bitmap & bit != 0) { // Only count if was allocated
+                mask |= bit;
+                freed += 1;
+            }
+        }
+
+        // Clear the bits
+        const new_bitmap = bitmap & ~mask;
+        self.page_bitmap.store(new_bitmap, .release);
+
+        _ = self.allocated_pages.fetchSub(freed, .monotonic);
+    }
+
+    // Check if segment has N contiguous free pages
+    pub fn hasContiguousFreePages(self: *Self, count: u5) bool {
+        const bitmap = self.page_bitmap.load(.acquire);
+        return findContiguousFree(bitmap, count) != null;
+    }
+
     // Free a page by index
     pub fn freePage(self: *Self, page_index: u5) void {
         if (page_index == 0) return; // Never free the header page
@@ -113,6 +182,30 @@ pub const Segment = struct {
         return @as(u32, config.PAGES_PER_SEGMENT) - allocated;
     }
 };
+
+// Find 'count' contiguous free bits in bitmap, starting from bit 1 (skip header)
+// Returns starting bit index or null if not found
+fn findContiguousFree(bitmap: u32, count: u5) ?u5 {
+    if (count == 0) return null;
+    if (count > 31) return null;
+
+    var start: u5 = 1; // Start from page 1 (page 0 is header)
+    while (start + count <= 32) {
+        var found = true;
+        var i: u5 = 0;
+        while (i < count) : (i += 1) {
+            const bit = @as(u32, 1) << (start + i);
+            if (bitmap & bit != 0) {
+                // Bit is set (page allocated), skip past it
+                start = start + i + 1;
+                found = false;
+                break;
+            }
+        }
+        if (found) return start;
+    }
+    return null;
+}
 
 // Global segment cache
 pub const SegmentCache = struct {

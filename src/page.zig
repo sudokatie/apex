@@ -44,8 +44,11 @@ pub const Page = struct {
     // Next page in slab's linked list
     next_page: ?*Page,
 
+    // Number of contiguous pages (for large allocations)
+    page_count: u8,
+
     // Reserved for alignment (to 64 bytes)
-    _reserved: [38]u8,
+    _reserved: [37]u8,
 
     const Self = @This();
 
@@ -61,6 +64,7 @@ pub const Page = struct {
         self.index = page_idx;
         self.state = .slab;
         self.size_class = size_class_idx;
+        self.page_count = 1;
 
         const block_size = config.SIZE_CLASSES[size_class_idx];
         const total = @as(u16, @intCast(USABLE_SIZE / block_size));
@@ -89,8 +93,8 @@ pub const Page = struct {
         last_ptr.* = 0xFFFF; // End marker
     }
 
-    // Initialize a page for large allocation
-    pub fn initLarge(self: *Self, seg: *Segment, page_idx: u5) void {
+    // Initialize a page for large allocation (single or multi-page)
+    pub fn initLarge(self: *Self, seg: *Segment, page_idx: u5, num_pages: u8) void {
         self.segment = seg;
         self.index = page_idx;
         self.state = .large;
@@ -98,6 +102,7 @@ pub const Page = struct {
         self.used_blocks = Atomic(u16).init(0);
         self.free_list_head = 0;
         self.total_blocks = 0;
+        self.page_count = num_pages;
     }
 
     // Get pointer to usable data area
