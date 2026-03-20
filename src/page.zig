@@ -41,8 +41,11 @@ pub const Page = struct {
     // Total blocks in page (for slab pages)
     total_blocks: u16,
 
+    // Next page in slab's linked list
+    next_page: ?*Page,
+
     // Reserved for alignment (to 64 bytes)
-    _reserved: [46]u8,
+    _reserved: [38]u8,
 
     const Self = @This();
 
