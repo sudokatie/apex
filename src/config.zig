@@ -17,18 +17,32 @@ pub const SIZE_CLASSES = [_]usize{
 };
 pub const NUM_SIZE_CLASSES: usize = SIZE_CLASSES.len;
 
-// Threshold for large allocations (use full pages instead of slab)
-pub const LARGE_THRESHOLD: usize = 2048;
-
-// Threshold for huge allocations (direct mmap)
-pub const HUGE_THRESHOLD: usize = SEGMENT_SIZE;
+// Allocation class thresholds (per spec 2.2)
+// Small: 8-2048 bytes (slab allocation)
+// Medium: 2KB-32KB (page allocation)
+// Large: 32KB-2MB (segment allocation)
+// Huge: >2MB (direct mmap)
+pub const SMALL_THRESHOLD: usize = 2048; // Max size for slab allocation
+pub const MEDIUM_THRESHOLD: usize = 32 * 1024; // Max size for page allocation
+pub const LARGE_THRESHOLD: usize = SMALL_THRESHOLD; // Legacy alias
+pub const HUGE_THRESHOLD: usize = SEGMENT_SIZE; // Above this = direct mmap
 
 // Thread cache configuration
 pub const THREAD_CACHE_MAX_BLOCKS: usize = 256; // Max blocks per size class in thread cache
 pub const THREAD_CACHE_FILL_COUNT: usize = 32; // Blocks to fill from heap at once
+pub const THREAD_CACHE_MAX_PAGES: usize = 4; // Max pages in per-thread page pool
 
 // Segment cache configuration
 pub const SEGMENT_CACHE_MAX: usize = 4; // Max cached free segments
+
+// Huge page sizes (for huge page support)
+pub const HUGE_PAGE_2MB: usize = 2 * 1024 * 1024;
+pub const HUGE_PAGE_1GB: usize = 1024 * 1024 * 1024;
+
+// Performance targets (for validation)
+pub const TARGET_SMALL_ALLOC_NS: u64 = 50; // <50ns average
+pub const TARGET_SMALL_FREE_NS: u64 = 30; // <30ns average
+pub const TARGET_FRAGMENTATION_PCT: u64 = 20; // <20% overhead
 
 // Platform detection
 pub const Platform = enum {
@@ -44,6 +58,10 @@ pub const current_platform: Platform = switch (builtin.os.tag) {
     .windows => .windows,
     else => .other,
 };
+
+// NUMA configuration
+pub const NUMA_MAX_NODES: usize = 8;
+pub const NUMA_ENABLED: bool = current_platform == .linux;
 
 // Get size class index for a given size
 pub fn sizeClassIndex(size: usize) ?usize {
@@ -66,6 +84,26 @@ pub fn blocksPerPage(class_size: usize) usize {
     // Reserve space for page header (64 bytes)
     const usable = PAGE_SIZE - 64;
     return usable / class_size;
+}
+
+// Determine allocation class for a size
+pub const AllocClass = enum {
+    small, // Slab allocation
+    medium, // Page allocation
+    large, // Segment allocation
+    huge, // Direct mmap
+};
+
+pub fn allocClass(size: usize) AllocClass {
+    if (size <= SMALL_THRESHOLD) return .small;
+    if (size <= MEDIUM_THRESHOLD) return .medium;
+    if (size <= HUGE_THRESHOLD) return .large;
+    return .huge;
+}
+
+// Pages needed for a medium allocation
+pub fn pagesForMedium(size: usize) usize {
+    return (size + PAGE_SIZE - 1) / PAGE_SIZE;
 }
 
 test "size class lookup" {
@@ -100,6 +138,18 @@ test "blocks per page" {
     try testing.expectEqual(@as(usize, 8184), blocksPerPage(8));
     // 2048 byte blocks: 65472 / 2048 = 31 blocks
     try testing.expectEqual(@as(usize, 31), blocksPerPage(2048));
+}
+
+test "allocation class" {
+    const testing = std.testing;
+
+    try testing.expectEqual(AllocClass.small, allocClass(64));
+    try testing.expectEqual(AllocClass.small, allocClass(2048));
+    try testing.expectEqual(AllocClass.medium, allocClass(2049));
+    try testing.expectEqual(AllocClass.medium, allocClass(32 * 1024));
+    try testing.expectEqual(AllocClass.large, allocClass(32 * 1024 + 1));
+    try testing.expectEqual(AllocClass.large, allocClass(2 * 1024 * 1024));
+    try testing.expectEqual(AllocClass.huge, allocClass(2 * 1024 * 1024 + 1));
 }
 
 test "platform detection" {

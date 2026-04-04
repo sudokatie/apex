@@ -95,10 +95,17 @@ Segments are 2MB chunks from the OS, aligned for efficient pointer-to-metadata l
 
 ## Limitations
 
-- No memory profiler integration (yet)
 - Windows support is basic (works, not optimized)
-- No NUMA awareness
-- Thread cache cleanup relies on explicit flush
+- NUMA support is basic (Linux/Windows only, not heavily optimized)
+
+## Platform Features
+
+| Feature | Linux | macOS | Windows |
+|---------|-------|-------|---------|
+| Core allocation | Full | Full | Full |
+| Huge pages | Yes (THP) | Limited | Yes |
+| NUMA | Yes | No | Yes |
+| Auto thread cleanup | Yes | Yes | Yes |
 
 ## License
 

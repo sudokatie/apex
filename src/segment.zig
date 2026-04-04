@@ -18,6 +18,9 @@ pub const Segment = struct {
     // Number of allocated pages
     allocated_pages: Atomic(u32),
 
+    // Bitmap of decommitted pages (1 = decommitted, 0 = committed)
+    decommit_bitmap: Atomic(u32),
+
     // Lock for thread safety during allocation
     lock: std.Thread.Mutex,
 
@@ -25,7 +28,7 @@ pub const Segment = struct {
     next: ?*Segment,
 
     // Reserved for future use (cache line padding)
-    _reserved: [40]u8,
+    _reserved: [36]u8,
 
     const Self = @This();
 
@@ -37,9 +40,10 @@ pub const Segment = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.page_bitmap = Atomic(u32).init(1); // Page 0 is always allocated (header)
         self.allocated_pages = Atomic(u32).init(1);
+        self.decommit_bitmap = Atomic(u32).init(0);
         self.lock = .{};
         self.next = null;
-        self._reserved = [_]u8{0} ** 40;
+        self._reserved = [_]u8{0} ** 36;
         return self;
     }
 
@@ -75,6 +79,9 @@ pub const Segment = struct {
 
         _ = self.allocated_pages.fetchAdd(1, .monotonic);
 
+        // Recommit if page was decommitted
+        self.recommitPage(free_bit);
+
         return free_bit;
     }
 
@@ -105,6 +112,12 @@ pub const Segment = struct {
         self.page_bitmap.store(new_bitmap, .release);
 
         _ = self.allocated_pages.fetchAdd(count, .monotonic);
+
+        // Recommit all pages
+        i = 0;
+        while (i < count) : (i += 1) {
+            self.recommitPageUnlocked(start_idx + i);
+        }
 
         return start_idx;
     }
@@ -181,6 +194,112 @@ pub const Segment = struct {
         const allocated = self.allocated_pages.load(.acquire);
         return @as(u32, config.PAGES_PER_SEGMENT) - allocated;
     }
+
+    // Decommit a page (release physical memory)
+    pub fn decommitPage(self: *Self, page_index: u5) void {
+        if (page_index == 0) return; // Never decommit header
+
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        self.decommitPageUnlocked(page_index);
+    }
+
+    fn decommitPageUnlocked(self: *Self, page_index: u5) void {
+        const decommit = self.decommit_bitmap.load(.acquire);
+        const mask = @as(u32, 1) << page_index;
+
+        if (decommit & mask != 0) return; // Already decommitted
+
+        // Mark as decommitted
+        self.decommit_bitmap.store(decommit | mask, .release);
+
+        // Actually decommit the memory
+        const page_ptr = self.pageAddress(page_index);
+        platform.decommitMemory(page_ptr, config.PAGE_SIZE);
+    }
+
+    // Recommit a page (make physical memory available)
+    fn recommitPage(self: *Self, page_index: u5) void {
+        // Lock already held
+        self.recommitPageUnlocked(page_index);
+    }
+
+    fn recommitPageUnlocked(self: *Self, page_index: u5) void {
+        const decommit = self.decommit_bitmap.load(.acquire);
+        const mask = @as(u32, 1) << page_index;
+
+        if (decommit & mask == 0) return; // Not decommitted
+
+        // Clear decommit flag
+        self.decommit_bitmap.store(decommit & ~mask, .release);
+
+        // Recommit the memory
+        const page_ptr = self.pageAddress(page_index);
+        _ = platform.commitMemory(page_ptr, config.PAGE_SIZE);
+    }
+
+    // Decommit all free pages (call when segment goes to cache)
+    pub fn decommitFreePages(self: *Self) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const bitmap = self.page_bitmap.load(.acquire);
+
+        // Decommit each free page (bit is 0)
+        // Use u6 to avoid overflow when incrementing from 31
+        var i: u6 = 1; // Skip header page
+        while (i < 32) : (i += 1) {
+            const page_idx: u5 = @intCast(i);
+            const mask = @as(u32, 1) << page_idx;
+            if (bitmap & mask == 0) {
+                // Page is free, decommit it
+                self.decommitPageUnlocked(page_idx);
+            }
+        }
+    }
+
+    // Coalesce free pages (update tracking for contiguous runs)
+    // Returns the start and count of the largest contiguous free region
+    pub fn findLargestFreeRegion(self: *Self) ?struct { start: u5, count: u5 } {
+        const bitmap = self.page_bitmap.load(.acquire);
+
+        var best_start: u5 = 0;
+        var best_count: u5 = 0;
+
+        var current_start: u5 = 1; // Skip header
+        var current_count: u5 = 0;
+
+        // Use u6 for loop counter to avoid overflow when i=31
+        var i: u6 = 1;
+        while (i < 32) : (i += 1) {
+            const page_idx: u5 = @intCast(i);
+            const mask = @as(u32, 1) << page_idx;
+            if (bitmap & mask == 0) {
+                // Free page
+                if (current_count == 0) {
+                    current_start = page_idx;
+                }
+                current_count +|= 1; // Saturating add to avoid overflow
+            } else {
+                // Allocated page - check if current run is best
+                if (current_count > best_count) {
+                    best_start = current_start;
+                    best_count = current_count;
+                }
+                current_count = 0;
+            }
+        }
+
+        // Check final run
+        if (current_count > best_count) {
+            best_start = current_start;
+            best_count = current_count;
+        }
+
+        if (best_count == 0) return null;
+        return .{ .start = best_start, .count = best_count };
+    }
 };
 
 // Find 'count' contiguous free bits in bitmap, starting from bit 1 (skip header)
@@ -189,12 +308,16 @@ fn findContiguousFree(bitmap: u32, count: u5) ?u5 {
     if (count == 0) return null;
     if (count > 31) return null;
 
-    var start: u5 = 1; // Start from page 1 (page 0 is header)
-    while (start + count <= 32) {
+    // Use u6 for arithmetic to avoid u5 overflow
+    const count_u6: u6 = count;
+    var start: u6 = 1; // Start from page 1 (page 0 is header)
+    
+    while (start + count_u6 <= 32) {
         var found = true;
-        var i: u5 = 0;
-        while (i < count) : (i += 1) {
-            const bit = @as(u32, 1) << (start + i);
+        var i: u6 = 0;
+        while (i < count_u6) : (i += 1) {
+            const bit_idx: u5 = @intCast(start + i);
+            const bit = @as(u32, 1) << bit_idx;
             if (bitmap & bit != 0) {
                 // Bit is set (page allocated), skip past it
                 start = start + i + 1;
@@ -202,25 +325,39 @@ fn findContiguousFree(bitmap: u32, count: u5) ?u5 {
                 break;
             }
         }
-        if (found) return start;
+        if (found) return @intCast(start);
     }
     return null;
 }
 
-// Global segment cache
+// Global segment cache with NUMA support
 pub const SegmentCache = struct {
-    // List of cached free segments
+    // List of cached free segments (global pool)
     free_list: ?*Segment,
     free_count: usize,
     lock: std.Thread.Mutex,
 
+    // Per-NUMA-node segment pools
+    numa_pools: [config.NUMA_MAX_NODES]NumaPool,
+
+    const NumaPool = struct {
+        head: ?*Segment,
+        count: usize,
+    };
+
     const Self = @This();
 
     pub fn init() Self {
+        var numa_pools: [config.NUMA_MAX_NODES]NumaPool = undefined;
+        for (&numa_pools) |*pool| {
+            pool.* = .{ .head = null, .count = 0 };
+        }
+
         return .{
             .free_list = null,
             .free_count = 0,
             .lock = .{},
+            .numa_pools = numa_pools,
         };
     }
 
@@ -244,11 +381,42 @@ pub const SegmentCache = struct {
         return allocateSegment();
     }
 
+    // Get a segment preferring a specific NUMA node
+    pub fn acquireForNode(self: *Self, node: u8) ?*Segment {
+        if (node >= config.NUMA_MAX_NODES) return self.acquire();
+
+        self.lock.lock();
+
+        // Try NUMA-local pool first
+        if (self.numa_pools[node].head) |seg| {
+            self.numa_pools[node].head = seg.next;
+            self.numa_pools[node].count -= 1;
+            self.lock.unlock();
+            return Segment.init(@ptrCast(seg));
+        }
+
+        // Try global pool
+        if (self.free_list) |seg| {
+            self.free_list = seg.next;
+            self.free_count -= 1;
+            self.lock.unlock();
+            return Segment.init(@ptrCast(seg));
+        }
+
+        self.lock.unlock();
+
+        // Allocate new segment on specific NUMA node
+        return allocateSegmentOnNode(node);
+    }
+
     // Return a segment to cache or release to OS
     pub fn release(self: *Self, segment: *Segment) void {
         self.lock.lock();
 
         if (self.free_count < config.SEGMENT_CACHE_MAX) {
+            // Lazy decommit: release physical pages for free pages
+            segment.decommitFreePages();
+
             // Add to cache
             segment.next = self.free_list;
             self.free_list = segment;
@@ -260,11 +428,70 @@ pub const SegmentCache = struct {
             releaseSegment(segment);
         }
     }
+
+    // Return a segment to NUMA-specific pool
+    pub fn releaseToNode(self: *Self, segment: *Segment, node: u8) void {
+        if (node >= config.NUMA_MAX_NODES) {
+            self.release(segment);
+            return;
+        }
+
+        self.lock.lock();
+
+        const pool = &self.numa_pools[node];
+        if (pool.count < config.SEGMENT_CACHE_MAX) {
+            segment.decommitFreePages();
+            segment.next = pool.head;
+            pool.head = segment;
+            pool.count += 1;
+            self.lock.unlock();
+        } else {
+            self.lock.unlock();
+            releaseSegment(segment);
+        }
+    }
+
+    // Trim the cache (release excess segments)
+    pub fn trim(self: *Self, target_count: usize) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        while (self.free_count > target_count) {
+            const seg = self.free_list orelse break;
+            self.free_list = seg.next;
+            self.free_count -= 1;
+            releaseSegment(seg);
+        }
+    }
+
+    // Get total cached segments across all pools
+    pub fn getTotalCached(self: *Self) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        var total = self.free_count;
+        for (self.numa_pools) |pool| {
+            total += pool.count;
+        }
+        return total;
+    }
 };
 
 // Allocate a new 2MB segment from the OS
 pub fn allocateSegment() ?*Segment {
     const ptr = platform.mapMemory(config.SEGMENT_SIZE, config.SEGMENT_ALIGNMENT) orelse return null;
+    return Segment.init(ptr);
+}
+
+// Allocate a new segment on a specific NUMA node
+pub fn allocateSegmentOnNode(node: u8) ?*Segment {
+    const ptr = platform.mapOnNode(config.SEGMENT_SIZE, config.SEGMENT_ALIGNMENT, node) orelse return null;
+    return Segment.init(ptr);
+}
+
+// Allocate a segment using huge pages (if available)
+pub fn allocateSegmentHugePages() ?*Segment {
+    const ptr = platform.mapHugePages(config.SEGMENT_SIZE, config.HUGE_PAGE_2MB) orelse return null;
     return Segment.init(ptr);
 }
 
@@ -331,6 +558,45 @@ test "segment page free" {
     try std.testing.expect(seg.isEmpty());
 }
 
+test "segment decommit" {
+    const seg = allocateSegment() orelse return error.AllocFailed;
+    defer releaseSegment(seg);
+
+    const p1 = seg.allocPage() orelse return error.AllocFailed;
+    seg.freePage(p1);
+
+    // Decommit the free page
+    seg.decommitPage(p1);
+    try std.testing.expect(seg.decommit_bitmap.load(.acquire) & (@as(u32, 1) << p1) != 0);
+
+    // Allocate again - should recommit
+    const p2 = seg.allocPage() orelse return error.AllocFailed;
+    try std.testing.expectEqual(p1, p2);
+    try std.testing.expect(seg.decommit_bitmap.load(.acquire) & (@as(u32, 1) << p1) == 0);
+}
+
+test "segment largest free region" {
+    const seg = allocateSegment() orelse return error.AllocFailed;
+    defer releaseSegment(seg);
+
+    // Allocate some pages to create gaps
+    _ = seg.allocPage(); // Page 1
+    _ = seg.allocPage(); // Page 2
+    const p3 = seg.allocPage() orelse return error.AllocFailed; // Page 3
+    _ = seg.allocPage(); // Page 4
+
+    // Free page 2 and 3 to create a gap
+    seg.freePage(2);
+    seg.freePage(p3);
+
+    const region = seg.findLargestFreeRegion();
+    try std.testing.expect(region != null);
+
+    // Largest free region should be pages 5-31 (27 pages)
+    // or 2-3 (2 pages) depending on implementation
+    try std.testing.expect(region.?.count >= 2);
+}
+
 test "segment cache" {
     var cache = SegmentCache.init();
 
@@ -377,4 +643,24 @@ test "allocate all pages" {
     // Next allocation should fail
     try std.testing.expect(seg.allocPage() == null);
     try std.testing.expect(!seg.hasFreePages());
+}
+
+test "segment cache trim" {
+    var cache = SegmentCache.init();
+
+    // Add several segments to cache
+    var i: usize = 0;
+    while (i < 3) : (i += 1) {
+        const seg = allocateSegment() orelse return error.AllocFailed;
+        cache.release(seg);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), cache.free_count);
+
+    // Trim to 1
+    cache.trim(1);
+    try std.testing.expectEqual(@as(usize, 1), cache.free_count);
+
+    // Clean up
+    cache.trim(0);
 }

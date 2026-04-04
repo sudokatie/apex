@@ -2,10 +2,40 @@
 //
 // Fast bump-pointer allocation with bulk deallocation.
 // No individual frees - memory is released all at once via reset() or deinit().
+// Supports optional backing allocator (per spec 8.2).
 
 const std = @import("std");
 const config = @import("config.zig");
 const platform = @import("platform.zig");
+const heap_mod = @import("heap.zig");
+
+// Backing allocator type
+pub const BackingAllocator = union(enum) {
+    platform: void, // Use platform.mapMemory
+    heap: *heap_mod.Heap, // Use Apex heap
+    std_allocator: std.mem.Allocator, // Use any std.mem.Allocator
+
+    pub fn alloc(self: BackingAllocator, size: usize) ?[*]u8 {
+        return switch (self) {
+            .platform => platform.mapMemory(size, std.heap.page_size_min),
+            .heap => |h| h.alloc(size),
+            .std_allocator => |a| {
+                const slice = a.alloc(u8, size) catch return null;
+                return slice.ptr;
+            },
+        };
+    }
+
+    pub fn free(self: BackingAllocator, ptr: [*]u8, size: usize) void {
+        switch (self) {
+            .platform => platform.unmapMemory(ptr, size),
+            .heap => |h| h.free(ptr),
+            .std_allocator => |a| {
+                a.free(ptr[0..size]);
+            },
+        }
+    }
+};
 
 // Arena chunk - a contiguous block of memory
 const Chunk = struct {
@@ -21,24 +51,29 @@ const Chunk = struct {
     // Next chunk in list
     next: ?*Chunk,
 
+    // Backing allocator used for this chunk
+    backing: BackingAllocator,
+
     const HEADER_SIZE: usize = 64;
 
-    fn create(size: usize) ?*Chunk {
+    fn create(size: usize, backing: BackingAllocator) ?*Chunk {
         const total = size + HEADER_SIZE;
-        const ptr = platform.mapMemory(total, std.heap.page_size_min) orelse return null;
+        const ptr = backing.alloc(total) orelse return null;
 
         const chunk: *Chunk = @ptrCast(@alignCast(ptr));
         chunk.data = ptr + HEADER_SIZE;
         chunk.size = size;
         chunk.offset = 0;
         chunk.next = null;
+        chunk.backing = backing;
 
         return chunk;
     }
 
     fn destroy(self: *Chunk) void {
         const ptr: [*]u8 = @ptrCast(self);
-        platform.unmapMemory(ptr, self.size + HEADER_SIZE);
+        const total = self.size + HEADER_SIZE;
+        self.backing.free(ptr, total);
     }
 
     fn remaining(self: *Chunk) usize {
@@ -75,26 +110,60 @@ pub const Arena = struct {
     // Default chunk size
     chunk_size: usize,
 
+    // Backing allocator
+    backing: BackingAllocator,
+
     // Statistics
     total_allocated: usize,
     chunk_count: usize,
+    peak_allocated: usize,
 
     const Self = @This();
 
     // Default chunk size: 64KB
     const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 
+    /// Create arena with default settings (uses platform mmap)
     pub fn init() Self {
-        return initWithSize(DEFAULT_CHUNK_SIZE);
+        return initWithBacking(.{ .platform = {} });
     }
 
+    /// Create arena with custom chunk size
     pub fn initWithSize(chunk_size: usize) Self {
         return .{
             .head = null,
             .current = null,
             .chunk_size = chunk_size,
+            .backing = .{ .platform = {} },
             .total_allocated = 0,
             .chunk_count = 0,
+            .peak_allocated = 0,
+        };
+    }
+
+    /// Create arena with backing allocator (per spec 8.2)
+    pub fn initWithBacking(backing: BackingAllocator) Self {
+        return .{
+            .head = null,
+            .current = null,
+            .chunk_size = DEFAULT_CHUNK_SIZE,
+            .backing = backing,
+            .total_allocated = 0,
+            .chunk_count = 0,
+            .peak_allocated = 0,
+        };
+    }
+
+    /// Create arena with backing allocator and custom chunk size
+    pub fn initFull(backing: BackingAllocator, chunk_size: usize) Self {
+        return .{
+            .head = null,
+            .current = null,
+            .chunk_size = chunk_size,
+            .backing = backing,
+            .total_allocated = 0,
+            .chunk_count = 0,
+            .peak_allocated = 0,
         };
     }
 
@@ -111,13 +180,14 @@ pub const Arena = struct {
         if (self.current) |chunk| {
             if (chunk.alloc(size, alignment)) |ptr| {
                 self.total_allocated += size;
+                self.peak_allocated = @max(self.peak_allocated, self.total_allocated);
                 return ptr;
             }
         }
 
         // Need a new chunk
         const chunk_size = @max(self.chunk_size, size + alignment);
-        const chunk = Chunk.create(chunk_size) orelse return null;
+        const chunk = Chunk.create(chunk_size, self.backing) orelse return null;
 
         // Link to list
         chunk.next = self.head;
@@ -127,6 +197,7 @@ pub const Arena = struct {
 
         if (chunk.alloc(size, alignment)) |ptr| {
             self.total_allocated += size;
+            self.peak_allocated = @max(self.peak_allocated, self.total_allocated);
             return ptr;
         }
 
@@ -199,6 +270,18 @@ pub const Arena = struct {
         }
         return total;
     }
+
+    // Get peak allocated bytes
+    pub fn getPeakAllocated(self: *Self) usize {
+        return self.peak_allocated;
+    }
+
+    // Get fragmentation ratio (1.0 = no fragmentation)
+    pub fn getEfficiency(self: *Self) f64 {
+        const capacity = self.getTotalCapacity();
+        if (capacity == 0) return 1.0;
+        return @as(f64, @floatFromInt(self.total_allocated)) / @as(f64, @floatFromInt(capacity));
+    }
 };
 
 // Align value up to alignment
@@ -247,7 +330,8 @@ pub const ArenaAllocator = struct {
     }
 };
 
-// Tests
+// ============= Tests =============
+
 test "arena basic allocation" {
     var arena = Arena.init();
     defer arena.deinit();
@@ -261,6 +345,28 @@ test "arena basic allocation" {
     p3[0] = 3;
 
     try std.testing.expectEqual(@as(usize, 1), arena.getChunkCount());
+}
+
+test "arena with backing allocator" {
+    // Test with std page allocator as backing
+    var arena = Arena.initWithBacking(.{ .std_allocator = std.heap.page_allocator });
+    defer arena.deinit();
+
+    const p1 = arena.alloc(100) orelse return error.AllocFailed;
+    p1[0] = 42;
+    try std.testing.expectEqual(@as(u8, 42), p1[0]);
+}
+
+test "arena with heap backing" {
+    var heap = heap_mod.Heap.init();
+    heap.initAllocators();
+
+    var arena = Arena.initWithBacking(.{ .heap = &heap });
+    defer arena.deinit();
+
+    const p1 = arena.alloc(100) orelse return error.AllocFailed;
+    p1[0] = 42;
+    try std.testing.expectEqual(@as(u8, 42), p1[0]);
 }
 
 test "arena typed allocation" {
@@ -343,4 +449,32 @@ test "arena multiple chunks" {
     }
 
     try std.testing.expect(arena.getChunkCount() > 1);
+}
+
+test "arena efficiency" {
+    var arena = Arena.init();
+    defer arena.deinit();
+
+    _ = arena.alloc(32000) orelse return error.AllocFailed;
+
+    const efficiency = arena.getEfficiency();
+    try std.testing.expect(efficiency > 0.4); // At least 40% efficient
+}
+
+test "arena peak tracking" {
+    var arena = Arena.init();
+    defer arena.deinit();
+
+    _ = arena.alloc(1000) orelse return error.AllocFailed;
+    _ = arena.alloc(2000) orelse return error.AllocFailed;
+
+    const peak1 = arena.getPeakAllocated();
+    try std.testing.expect(peak1 >= 3000);
+
+    arena.reset();
+
+    _ = arena.alloc(500) orelse return error.AllocFailed;
+
+    // Peak should be unchanged
+    try std.testing.expectEqual(peak1, arena.getPeakAllocated());
 }

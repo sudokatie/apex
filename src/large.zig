@@ -29,7 +29,7 @@ pub const HugeHeader = struct {
     magic: u64,
 
     const MAGIC: u64 = 0xA9EF_DEAD_BEEF_CAFE;
-    const HEADER_SIZE: usize = 64; // Aligned to cache line
+    pub const HEADER_SIZE: usize = 64; // Aligned to cache line
 
     pub fn init(self: *HugeHeader, size: usize) void {
         self.size = size;
@@ -57,10 +57,21 @@ pub const HugeHeader = struct {
     }
 };
 
+// Track active large allocations for coalescing
+const LargeAllocation = struct {
+    segment: *Segment,
+    start_page: u5,
+    page_count: u8,
+    next: ?*LargeAllocation,
+};
+
 // Large allocator state
 pub const LargeAllocator = struct {
     // Segment cache for page-based allocations
     segment_cache: *segment_mod.SegmentCache,
+
+    // Active segments with large allocations (for coalescing)
+    active_segments: ?*Segment,
 
     // Tracking list for huge allocations
     huge_head: ?*HugeHeader,
@@ -75,6 +86,7 @@ pub const LargeAllocator = struct {
     pub fn init(cache: *segment_mod.SegmentCache) Self {
         return .{
             .segment_cache = cache,
+            .active_segments = null,
             .huge_head = null,
             .huge_count = 0,
             .huge_bytes = 0,
@@ -108,19 +120,43 @@ pub const LargeAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        // Get a segment with enough contiguous free pages
-        const seg = self.segment_cache.acquire() orelse return null;
+        const page_count: u5 = @intCast(pages_needed);
+
+        // First, try to find space in an active segment (coalescing opportunity)
+        var seg = self.active_segments;
+        while (seg) |s| {
+            if (s.hasContiguousFreePages(page_count)) {
+                const page_idx = s.allocPages(page_count) orelse {
+                    seg = s.next;
+                    continue;
+                };
+
+                const page: *Page = @ptrCast(@alignCast(s.pageAddress(page_idx)));
+                page.initLarge(s, page_idx, @intCast(pages_needed));
+
+                return page.dataStart();
+            }
+            seg = s.next;
+        }
+
+        // Get a new segment
+        const new_seg = self.segment_cache.acquire() orelse return null;
+
+        // Add to active segments list
+        new_seg.next = self.active_segments;
+        self.active_segments = new_seg;
 
         // Allocate contiguous pages
-        const page_count: u5 = @intCast(pages_needed);
-        const page_idx = seg.allocPages(page_count) orelse {
-            self.segment_cache.release(seg);
+        const page_idx = new_seg.allocPages(page_count) orelse {
+            // Remove from active list and release
+            self.active_segments = new_seg.next;
+            self.segment_cache.release(new_seg);
             return null;
         };
 
         // Initialize the first page with the page count
-        const page: *Page = @ptrCast(@alignCast(seg.pageAddress(page_idx)));
-        page.initLarge(seg, page_idx, @intCast(pages_needed));
+        const page: *Page = @ptrCast(@alignCast(new_seg.pageAddress(page_idx)));
+        page.initLarge(new_seg, page_idx, @intCast(pages_needed));
 
         return page.dataStart();
     }
@@ -176,9 +212,65 @@ pub const LargeAllocator = struct {
         // Free all contiguous pages
         seg.freePages(page.index, @intCast(page_count));
 
-        // If segment is empty, return to cache
+        // Try to coalesce with adjacent free regions
+        self.tryCoalesce(seg);
+
+        // If segment is empty, remove from active list and return to cache
         if (seg.isEmpty()) {
+            self.removeFromActiveList(seg);
             self.segment_cache.release(seg);
+        }
+    }
+
+    // Try to coalesce free pages in segment (merge adjacent free regions)
+    // This enables larger contiguous allocations after fragmentation
+    fn tryCoalesce(self: *Self, seg: *Segment) void {
+        _ = self;
+
+        // The segment bitmap tracks free pages
+        // We scan for adjacent free pages and ensure they can be allocated together
+        // This primarily helps by decommitting large free regions to reduce memory pressure
+
+        // Find the largest contiguous free region
+        if (seg.findLargestFreeRegion()) |region| {
+            // Decommit large free regions (>= 4 pages = 256KB) to return memory to OS
+            // Keep boundary pages committed for faster reallocation
+            if (region.count >= 4) {
+                // Use u6 for arithmetic to avoid u5 overflow
+                const start: u6 = region.start;
+                const count: u6 = region.count;
+                const end: u6 = start + count;
+
+                // Decommit middle pages, keep first and last committed
+                if (count > 2) {
+                    var i: u6 = start + 1;
+                    while (i + 1 < end) : (i += 1) {
+                        seg.decommitPage(@intCast(i));
+                    }
+                }
+            }
+        }
+
+        // Note: The segment's page_bitmap already allows contiguous allocation
+        // via allocPages(). True coalescing is implicit in the bitmap design -
+        // when adjacent pages are freed, they become a contiguous free region
+        // that can be allocated together on the next allocPages() call.
+    }
+
+    // Remove segment from active list
+    fn removeFromActiveList(self: *Self, seg: *Segment) void {
+        if (self.active_segments == seg) {
+            self.active_segments = seg.next;
+            return;
+        }
+
+        var prev = self.active_segments;
+        while (prev) |p| {
+            if (p.next == seg) {
+                p.next = seg.next;
+                return;
+            }
+            prev = p.next;
         }
     }
 
@@ -211,9 +303,17 @@ pub const LargeAllocator = struct {
             return null;
         }
 
+        // Check if we can grow in place for huge allocations
+        const potential_header = HugeHeader.fromDataPtr(ptr);
+        if (potential_header.isValid()) {
+            const usable = potential_header.usableSize();
+            if (new_size <= usable) {
+                return ptr; // Fits in current allocation
+            }
+        }
+
         if (new_size <= old_size) {
             // Shrinking - could return same pointer
-            // For huge allocations, might want to shrink
             return ptr;
         }
 
@@ -239,7 +339,7 @@ pub const LargeAllocator = struct {
         // Page-based allocation
         const page = page_mod.pageFromPtr(@ptrCast(ptr));
         if (page.state == .large) {
-            return Page.USABLE_SIZE;
+            return @as(usize, page.page_count) * config.PAGE_SIZE - Page.HEADER_SIZE;
         }
 
         return 0;
@@ -252,6 +352,20 @@ pub const LargeAllocator = struct {
 
     pub fn getHugeBytes(self: *Self) usize {
         return self.huge_bytes;
+    }
+
+    // Get number of active segments
+    pub fn getActiveSegmentCount(self: *Self) usize {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        var count: usize = 0;
+        var seg = self.active_segments;
+        while (seg) |s| {
+            count += 1;
+            seg = s.next;
+        }
+        return count;
     }
 };
 
@@ -355,4 +469,51 @@ test "multiple huge allocations" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), large.getHugeCount());
+}
+
+test "large allocation reuses segment space" {
+    var cache = segment_mod.SegmentCache.init();
+    var large = LargeAllocator.init(&cache);
+
+    // Allocate several large blocks in same segment
+    const p1 = large.alloc(64 * 1024) orelse return error.AllocFailed; // 1 page
+    const p2 = large.alloc(64 * 1024) orelse return error.AllocFailed; // 1 page
+    const p3 = large.alloc(64 * 1024) orelse return error.AllocFailed; // 1 page
+
+    // Should be in same segment (1 active segment)
+    try std.testing.expectEqual(@as(usize, 1), large.getActiveSegmentCount());
+
+    // Free middle allocation
+    large.free(p2);
+
+    // Allocate again - should reuse the freed space
+    const p4 = large.alloc(64 * 1024) orelse return error.AllocFailed;
+
+    // Still 1 active segment
+    try std.testing.expectEqual(@as(usize, 1), large.getActiveSegmentCount());
+
+    large.free(p1);
+    large.free(p3);
+    large.free(p4);
+
+    // Segment should be released
+    try std.testing.expectEqual(@as(usize, 0), large.getActiveSegmentCount());
+}
+
+test "coalescing of free pages" {
+    var cache = segment_mod.SegmentCache.init();
+    var large = LargeAllocator.init(&cache);
+
+    // Allocate 3 contiguous large blocks
+    const p1 = large.alloc(64 * 1024) orelse return error.AllocFailed;
+    const p2 = large.alloc(64 * 1024) orelse return error.AllocFailed;
+    const p3 = large.alloc(64 * 1024) orelse return error.AllocFailed;
+
+    // Free in order - should coalesce
+    large.free(p1);
+    large.free(p2);
+    large.free(p3);
+
+    // After freeing all, segment should be empty and released
+    try std.testing.expectEqual(@as(usize, 0), large.getActiveSegmentCount());
 }

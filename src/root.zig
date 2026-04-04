@@ -3,6 +3,7 @@
 // A modern slab allocator with thread caching, inspired by mimalloc and jemalloc.
 // Designed for low fragmentation and high throughput.
 
+const std = @import("std");
 pub const config = @import("config.zig");
 
 // Platform abstraction (OS-specific memory operations)
@@ -18,6 +19,9 @@ pub const heap = @import("heap.zig");
 pub const arena = @import("arena.zig");
 pub const stats = @import("stats.zig");
 
+// C ABI wrapper
+pub const cabi = @import("cabi.zig");
+
 // Stress tests (test-only)
 test {
     _ = @import("tests.zig");
@@ -27,6 +31,13 @@ test {
 pub const PAGE_SIZE = config.PAGE_SIZE;
 pub const SEGMENT_SIZE = config.SEGMENT_SIZE;
 pub const SIZE_CLASSES = config.SIZE_CLASSES;
+
+// Build configuration re-exports
+pub const BuildMode = heap.BuildMode;
+pub const build_mode = heap.build_mode;
+pub const enable_stats = heap.enable_stats;
+pub const enable_bounds_check = heap.enable_bounds_check;
+pub const enable_logging = heap.enable_logging;
 
 // ============= Public Allocator Interface =============
 
@@ -53,6 +64,11 @@ pub fn calloc(count: usize, size: usize) ?[*]u8 {
 /// Allocate memory with specific alignment
 pub fn allocAligned(size: usize, alignment: usize) ?[*]u8 {
     return heap.getHeap().allocAligned(size, alignment);
+}
+
+/// Free aligned allocation
+pub fn freeAligned(ptr: ?[*]u8) void {
+    heap.getHeap().freeAligned(ptr);
 }
 
 // ============= Arena Allocator Interface =============
@@ -104,6 +120,70 @@ pub fn statsToJson(writer: anytype) !void {
     try getStats().toJson(writer);
 }
 
+/// Get fragmentation percentage
+pub fn getFragmentation() f64 {
+    return getStats().getFragmentationPercent();
+}
+
+/// Get cache hit rate (0.0-1.0)
+pub fn getCacheHitRate() f64 {
+    return getStats().getCacheHitRate();
+}
+
+// ============= NUMA Interface =============
+
+/// Get number of NUMA nodes
+pub fn numaNodeCount() usize {
+    return platform.numaNodeCount();
+}
+
+/// Get current thread's NUMA node
+pub fn numaCurrentNode() u8 {
+    return platform.numaCurrentNode();
+}
+
+/// Allocate on specific NUMA node
+pub fn allocOnNode(size: usize, node: u8) ?[*]u8 {
+    return platform.mapOnNode(size, std.heap.page_size_min, node);
+}
+
+/// Check if NUMA is available
+pub fn numaAvailable() bool {
+    return platform.numaNodeCount() > 1;
+}
+
+// ============= Huge Page Interface =============
+
+/// Check if huge pages are available
+pub fn hugePageAvailable() bool {
+    return platform.hugePageAvailable(config.HUGE_PAGE_2MB);
+}
+
+/// Allocate using huge pages (falls back to regular if unavailable)
+pub fn allocHugePages(size: usize) ?[*]u8 {
+    return platform.mapHugePages(size, config.HUGE_PAGE_2MB);
+}
+
+// ============= Profiling Interface =============
+
+pub const ProfileEvent = platform.ProfileEvent;
+pub const ProfileCallback = platform.ProfileCallback;
+
+/// Enable memory profiling
+pub fn enableProfiling(callback: ProfileCallback) void {
+    platform.enableProfiling(callback);
+}
+
+/// Disable memory profiling
+pub fn disableProfiling() void {
+    platform.disableProfiling();
+}
+
+/// Check if profiling is enabled
+pub fn isProfilingEnabled() bool {
+    return platform.isProfilingEnabled();
+}
+
 // ============= Initialization =============
 
 /// Initialize the allocator (called automatically on first use)
@@ -116,9 +196,13 @@ pub fn getHeap() *heap.Heap {
     return heap.getHeap();
 }
 
+/// Thread exit cleanup - call when a thread exits
+pub fn onThreadExit() void {
+    heap.onThreadExit();
+}
+
 // Run all tests
 test {
-    const std = @import("std");
     std.testing.refAllDecls(@This());
 }
 
@@ -132,7 +216,6 @@ test "public alloc/free" {
 }
 
 test "public realloc" {
-    const std = @import("std");
     var ptr = alloc(64) orelse return error.AllocFailed;
     ptr[0] = 42;
 
@@ -143,13 +226,22 @@ test "public realloc" {
 }
 
 test "public calloc" {
-    const std = @import("std");
     const ptr = calloc(10, 10) orelse return error.AllocFailed;
     // Should be zeroed
     for (ptr[0..100]) |byte| {
         try std.testing.expectEqual(@as(u8, 0), byte);
     }
     free(ptr);
+}
+
+test "public aligned alloc" {
+    const alignments = [_]usize{ 32, 64, 128, 256, 512, 1024 };
+    for (alignments) |alignment| {
+        const ptr = allocAligned(100, alignment) orelse continue;
+        const addr = @intFromPtr(ptr);
+        try std.testing.expectEqual(@as(usize, 0), addr % alignment);
+        freeAligned(ptr);
+    }
 }
 
 test "arena interface" {
@@ -173,4 +265,12 @@ test "stats interface" {
     const s = getStats();
     _ = s.getTotalSlabAllocs();
     _ = s.getActiveSlabAllocs();
+}
+
+test "build mode" {
+    // Verify build mode is set
+    _ = build_mode;
+    _ = enable_stats;
+    _ = enable_bounds_check;
+    _ = enable_logging;
 }

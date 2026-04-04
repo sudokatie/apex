@@ -36,7 +36,7 @@ pub const Page = struct {
     used_blocks: Atomic(u16),
 
     // Free list head index (for slab pages)
-    free_list_head: u16,
+    free_list_head: Atomic(u16),
 
     // Total blocks in page (for slab pages)
     total_blocks: u16,
@@ -47,8 +47,18 @@ pub const Page = struct {
     // Number of contiguous pages (for large allocations)
     page_count: u8,
 
-    // Reserved for alignment (to 64 bytes)
-    _reserved: [37]u8,
+    // Thread that owns this page (for cross-thread free detection)
+    owner_thread: usize,
+
+    // Remote free list - blocks freed by other threads
+    remote_free_head: Atomic(?*RemoteFreeNode),
+    remote_free_count: Atomic(u16),
+
+    // Lock for remote free list draining
+    remote_lock: std.Thread.Mutex,
+
+    // Reserved for alignment
+    _reserved: [5]u8,
 
     const Self = @This();
 
@@ -60,17 +70,26 @@ pub const Page = struct {
 
     // Initialize a page for slab allocation
     pub fn initSlab(self: *Self, seg: *Segment, page_idx: u5, size_class_idx: u8) void {
+        self.initSlabWithOwner(seg, page_idx, size_class_idx, 0);
+    }
+
+    // Initialize a page for slab allocation with specific owner thread
+    pub fn initSlabWithOwner(self: *Self, seg: *Segment, page_idx: u5, size_class_idx: u8, owner: usize) void {
         self.segment = seg;
         self.index = page_idx;
         self.state = .slab;
         self.size_class = size_class_idx;
         self.page_count = 1;
+        self.owner_thread = owner;
+        self.remote_free_head = Atomic(?*RemoteFreeNode).init(null);
+        self.remote_free_count = Atomic(u16).init(0);
+        self.remote_lock = .{};
 
         const block_size = config.SIZE_CLASSES[size_class_idx];
         const total = @as(u16, @intCast(USABLE_SIZE / block_size));
         self.total_blocks = total;
         self.used_blocks = Atomic(u16).init(0);
-        self.free_list_head = 0; // Index of first free block
+        self.free_list_head = Atomic(u16).init(0); // Index of first free block
 
         // Initialize free list: each block points to next
         self.initFreeList(block_size, total);
@@ -100,9 +119,13 @@ pub const Page = struct {
         self.state = .large;
         self.size_class = 0;
         self.used_blocks = Atomic(u16).init(0);
-        self.free_list_head = 0;
+        self.free_list_head = Atomic(u16).init(0);
         self.total_blocks = 0;
         self.page_count = num_pages;
+        self.owner_thread = 0;
+        self.remote_free_head = Atomic(?*RemoteFreeNode).init(null);
+        self.remote_free_count = Atomic(u16).init(0);
+        self.remote_lock = .{};
     }
 
     // Get pointer to usable data area
@@ -115,25 +138,28 @@ pub const Page = struct {
     // Returns pointer to block or null if page is full
     pub fn allocBlock(self: *Self) ?[*]u8 {
         if (self.state != .slab) return null;
-        if (self.free_list_head == 0xFFFF) return null; // Full
+
+        // First, drain any remote frees
+        self.drainRemoteFrees();
+
+        const head = self.free_list_head.load(.acquire);
+        if (head == 0xFFFF) return null; // Full
 
         const block_size = config.SIZE_CLASSES[self.size_class];
         const data_start = @intFromPtr(self) + HEADER_SIZE;
 
         // Get the free block
-        const block_idx = self.free_list_head;
-        const block_addr = data_start + @as(usize, block_idx) * block_size;
-
-        // Update free list to next
+        const block_addr = data_start + @as(usize, head) * block_size;
         const next_ptr: *u16 = @ptrFromInt(block_addr);
-        self.free_list_head = next_ptr.*;
+        const next = next_ptr.*;
 
+        self.free_list_head.store(next, .release);
         _ = self.used_blocks.fetchAdd(1, .monotonic);
 
         return @ptrFromInt(block_addr);
     }
 
-    // Free a block back to this slab page
+    // Free a block back to this slab page (same thread)
     pub fn freeBlock(self: *Self, ptr: [*]u8) void {
         if (self.state != .slab) return;
 
@@ -147,26 +173,98 @@ pub const Page = struct {
 
         // Push onto free list
         const next_ptr: *u16 = @ptrCast(@alignCast(ptr));
-        next_ptr.* = self.free_list_head;
-        self.free_list_head = block_idx;
+        next_ptr.* = self.free_list_head.load(.acquire);
+        self.free_list_head.store(block_idx, .release);
 
         _ = self.used_blocks.fetchSub(1, .monotonic);
     }
 
+    // Free a block from a remote thread (lock-free push to remote list)
+    pub fn freeBlockRemote(self: *Self, ptr: [*]u8) void {
+        if (self.state != .slab) return;
+
+        const node: *RemoteFreeNode = @ptrCast(@alignCast(ptr));
+
+        // Lock-free push to remote free list
+        var head = self.remote_free_head.load(.acquire);
+        while (true) {
+            node.next = head;
+            const result = self.remote_free_head.cmpxchgWeak(
+                head,
+                node,
+                .release,
+                .acquire,
+            );
+            if (result) |current| {
+                head = current;
+            } else {
+                break;
+            }
+        }
+
+        _ = self.remote_free_count.fetchAdd(1, .monotonic);
+    }
+
+    // Drain remote free list into local free list (called by owning thread)
+    pub fn drainRemoteFrees(self: *Self) void {
+        const count = self.remote_free_count.load(.acquire);
+        if (count == 0) return;
+
+        self.remote_lock.lock();
+        defer self.remote_lock.unlock();
+
+        // Atomically take the entire remote list
+        const head = self.remote_free_head.swap(null, .acquire) orelse return;
+
+        const block_size = config.SIZE_CLASSES[self.size_class];
+        const data_start = @intFromPtr(self) + HEADER_SIZE;
+
+        // Process each node
+        var current: ?*RemoteFreeNode = head;
+        var drained: u16 = 0;
+
+        while (current) |node| {
+            const next = node.next;
+
+            // Convert node pointer to block index and add to local free list
+            const ptr_addr = @intFromPtr(node);
+            const offset = ptr_addr - data_start;
+            const block_idx = @as(u16, @intCast(offset / block_size));
+
+            const next_ptr: *u16 = @ptrCast(node);
+            next_ptr.* = self.free_list_head.load(.acquire);
+            self.free_list_head.store(block_idx, .release);
+
+            drained += 1;
+            current = next;
+        }
+
+        _ = self.remote_free_count.fetchSub(drained, .monotonic);
+        _ = self.used_blocks.fetchSub(drained, .monotonic);
+    }
+
     // Check if page has free blocks
     pub fn hasFreeBlocks(self: *Self) bool {
-        return self.free_list_head != 0xFFFF;
+        return self.free_list_head.load(.acquire) != 0xFFFF or
+            self.remote_free_count.load(.acquire) > 0;
     }
 
     // Check if page is empty (no blocks allocated)
     pub fn isEmpty(self: *Self) bool {
-        return self.used_blocks.load(.acquire) == 0;
+        return self.used_blocks.load(.acquire) == 0 and
+            self.remote_free_count.load(.acquire) == 0;
     }
 
     // Check if page is full
     pub fn isFull(self: *Self) bool {
-        return self.free_list_head == 0xFFFF;
+        return self.free_list_head.load(.acquire) == 0xFFFF and
+            self.remote_free_count.load(.acquire) == 0;
     }
+};
+
+// Node for remote free list (stored in the freed block)
+pub const RemoteFreeNode = struct {
+    next: ?*RemoteFreeNode,
 };
 
 // Get page from any pointer within it
@@ -199,6 +297,18 @@ test "page initialization for slab" {
     try std.testing.expectEqual(@as(u8, 0), page_ptr.size_class);
     try std.testing.expect(page_ptr.total_blocks > 0);
     try std.testing.expect(page_ptr.hasFreeBlocks());
+}
+
+test "page initialization with owner" {
+    const seg = segment_mod.allocateSegment() orelse return error.AllocFailed;
+    defer segment_mod.releaseSegment(seg);
+
+    const page_idx = seg.allocPage() orelse return error.AllocFailed;
+    const page_ptr: *Page = @ptrCast(@alignCast(seg.pageAddress(page_idx)));
+
+    page_ptr.initSlabWithOwner(seg, page_idx, 0, 12345);
+
+    try std.testing.expectEqual(@as(usize, 12345), page_ptr.owner_thread);
 }
 
 test "page block allocation" {
@@ -245,6 +355,31 @@ test "page block free" {
     try std.testing.expectEqual(@as(u16, 2), page_ptr.used_blocks.load(.acquire));
 
     page_ptr.freeBlock(b1);
+    try std.testing.expectEqual(@as(u16, 1), page_ptr.used_blocks.load(.acquire));
+
+    page_ptr.freeBlock(b2);
+    try std.testing.expect(page_ptr.isEmpty());
+}
+
+test "page remote free" {
+    const seg = segment_mod.allocateSegment() orelse return error.AllocFailed;
+    defer segment_mod.releaseSegment(seg);
+
+    const page_idx = seg.allocPage() orelse return error.AllocFailed;
+    const page_ptr: *Page = @ptrCast(@alignCast(seg.pageAddress(page_idx)));
+
+    page_ptr.initSlabWithOwner(seg, page_idx, 4, 100); // 64 bytes, owned by thread 100
+
+    const b1 = page_ptr.allocBlock() orelse return error.AllocFailed;
+    const b2 = page_ptr.allocBlock() orelse return error.AllocFailed;
+
+    // Simulate remote free (from another thread)
+    page_ptr.freeBlockRemote(b1);
+    try std.testing.expectEqual(@as(u16, 1), page_ptr.remote_free_count.load(.acquire));
+
+    // Drain should move it to local free list
+    page_ptr.drainRemoteFrees();
+    try std.testing.expectEqual(@as(u16, 0), page_ptr.remote_free_count.load(.acquire));
     try std.testing.expectEqual(@as(u16, 1), page_ptr.used_blocks.load(.acquire));
 
     page_ptr.freeBlock(b2);
