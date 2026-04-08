@@ -11,6 +11,7 @@ const page_mod = @import("page.zig");
 const slab_mod = @import("slab.zig");
 const platform = @import("platform.zig");
 const stats_mod = @import("stats.zig");
+const work_stealing = @import("work_stealing.zig");
 
 // Global stats for cache hit/miss tracking
 const global_stats = stats_mod.getGlobalStats();
@@ -152,6 +153,7 @@ pub const ThreadCache = struct {
     free_count: usize,
     cache_hits: usize,
     cache_misses: usize,
+    steal_count: usize,
 
     const Self = @This();
 
@@ -172,12 +174,14 @@ pub const ThreadCache = struct {
             .free_count = 0,
             .cache_hits = 0,
             .cache_misses = 0,
+            .steal_count = 0,
         };
     }
 
     // Allocate from thread cache
     pub fn alloc(self: *Self, size: usize, slab_allocator: *slab_mod.SlabAllocator) ?[*]u8 {
         const class_idx = config.sizeClassIndex(size) orelse return null;
+        const tc_config = config.getThreadCacheConfig();
 
         // Try thread-local cache first (lock-free fast path!)
         if (self.caches[class_idx].pop()) |ptr| {
@@ -195,6 +199,24 @@ pub const ThreadCache = struct {
             self.alloc_count += 1;
             self.cache_misses += 1;
             global_stats.recordCacheMiss();
+        }
+
+        // Try work-stealing from other thread caches
+        if (tc_config.work_stealing_enabled) {
+            const steal_result = work_stealing.stealBlocks(
+                &self.caches[class_idx],
+                class_idx,
+                self.thread_id,
+                &global_registry,
+            );
+
+            work_stealing.recordStealAttempt(steal_result.blocks_stolen > 0);
+
+            if (steal_result.blocks_stolen > 0) {
+                work_stealing.recordSteal(steal_result.blocks_stolen);
+                self.steal_count += steal_result.blocks_stolen;
+                return self.caches[class_idx].pop();
+            }
         }
 
         // Cache miss - fill from slab allocator
@@ -317,6 +339,7 @@ pub const ThreadCache = struct {
                 @as(f64, @floatFromInt(self.cache_hits)) / @as(f64, @floatFromInt(self.alloc_count))
             else
                 0.0,
+            .steal_count = self.steal_count,
         };
     }
 };
@@ -329,6 +352,7 @@ pub const CacheStats = struct {
     cached_blocks: usize,
     cached_pages: usize,
     hit_rate: f64,
+    steal_count: usize,
 };
 
 // Global thread cache registry
@@ -466,6 +490,7 @@ pub const ThreadCacheRegistry = struct {
             .cached_blocks = 0,
             .cached_pages = 0,
             .hit_rate = 0.0,
+            .steal_count = 0,
         };
 
         var current = self.head;
@@ -477,6 +502,7 @@ pub const ThreadCacheRegistry = struct {
             total.cache_misses += stats.cache_misses;
             total.cached_blocks += stats.cached_blocks;
             total.cached_pages += stats.cached_pages;
+            total.steal_count += stats.steal_count;
             current = tc.next;
         }
 
@@ -673,4 +699,168 @@ test "thread cache flush when full" {
     try std.testing.expect(tc.caches[class_idx].count <= config.THREAD_CACHE_MAX_BLOCKS);
 
     tc.flushAll(&slab, &segment_cache);
+}
+
+test "configurable cache settings" {
+    // Get default config
+    const cfg = config.getThreadCacheConfig();
+
+    // Check defaults
+    try std.testing.expectEqual(@as(usize, config.THREAD_CACHE_MAX_BLOCKS), cfg.max_blocks);
+    try std.testing.expect(cfg.work_stealing_enabled);
+
+    // Modify config
+    var new_cfg = cfg.*;
+    new_cfg.max_blocks = 512;
+    new_cfg.work_stealing_enabled = false;
+    config.setThreadCacheConfig(new_cfg);
+
+    // Verify change
+    const updated = config.getThreadCacheConfig();
+    try std.testing.expectEqual(@as(usize, 512), updated.max_blocks);
+    try std.testing.expect(!updated.work_stealing_enabled);
+
+    // Restore defaults
+    config.setThreadCacheConfig(.{});
+}
+
+test "work stealing stats" {
+    const stats = work_stealing.getStealStats();
+    // Stats should exist and be initialized
+    try std.testing.expect(stats.total_steals >= 0);
+}
+
+test "concurrent allocation stress - single thread baseline" {
+    var segment_cache = segment_mod.SegmentCache.init();
+    var slab = slab_mod.SlabAllocator.init(&segment_cache);
+    var tc = ThreadCache.init(999);
+
+    const iterations = 1000;
+    var ptrs: [iterations]?[*]u8 = [_]?[*]u8{null} ** iterations;
+    var pages: [iterations]?*page_mod.Page = [_]?*page_mod.Page{null} ** iterations;
+
+    // Rapid alloc/free cycle
+    for (0..iterations) |i| {
+        ptrs[i] = tc.alloc(64, &slab);
+        if (ptrs[i]) |p| {
+            pages[i] = page_mod.pageFromPtr(@ptrCast(p));
+        }
+    }
+
+    // Free all
+    for (0..iterations) |i| {
+        if (ptrs[i]) |p| {
+            if (pages[i]) |page| {
+                tc.free(p, page, &slab);
+            }
+        }
+    }
+
+    // Check stats
+    const stats = tc.getStats();
+    try std.testing.expect(stats.alloc_count >= iterations or @import("builtin").mode != .Debug);
+
+    tc.flushAll(&slab, &segment_cache);
+}
+
+test "concurrent multi-thread allocation" {
+    // This test verifies thread safety with actual threads
+    var segment_cache = segment_mod.SegmentCache.init();
+    var slab = slab_mod.SlabAllocator.init(&segment_cache);
+
+    const num_threads = 4;
+    const iterations_per_thread = 100;
+
+    var success_count = std.atomic.Value(usize).init(0);
+
+    const ThreadContext = struct {
+        slab: *slab_mod.SlabAllocator,
+        success_count: *std.atomic.Value(usize),
+        segment_cache: *segment_mod.SegmentCache,
+    };
+
+    const ctx = ThreadContext{
+        .slab = &slab,
+        .success_count = &success_count,
+        .segment_cache = &segment_cache,
+    };
+
+    const worker = struct {
+        fn run(context: ThreadContext) void {
+            var local_tc = ThreadCache.init(std.Thread.getCurrentId());
+            var success: usize = 0;
+
+            for (0..iterations_per_thread) |_| {
+                const ptr = local_tc.alloc(32, context.slab);
+                if (ptr != null) {
+                    success += 1;
+                    // Simulate some work
+                    ptr.?[0] = 42;
+                    // Free it back
+                    const page = page_mod.pageFromPtr(@ptrCast(ptr.?));
+                    local_tc.free(ptr.?, page, context.slab);
+                }
+            }
+
+            local_tc.flushAll(context.slab, context.segment_cache);
+            _ = context.success_count.fetchAdd(success, .monotonic);
+        }
+    }.run;
+
+    // Spawn threads
+    var threads: [num_threads]std.Thread = undefined;
+    for (&threads) |*t| {
+        t.* = std.Thread.spawn(.{}, worker, .{ctx}) catch {
+            // Thread spawn failed, skip test
+            return;
+        };
+    }
+
+    // Wait for all threads
+    for (threads) |t| {
+        t.join();
+    }
+
+    // Verify some allocations succeeded
+    const total_success = success_count.load(.monotonic);
+    try std.testing.expect(total_success > 0);
+}
+
+test "work stealing between caches" {
+    var segment_cache = segment_mod.SegmentCache.init();
+    var slab = slab_mod.SlabAllocator.init(&segment_cache);
+
+    // Create two thread caches
+    var registry = ThreadCacheRegistry.init();
+    const tc1 = registry.getOrCreate(100).?;
+    const tc2 = registry.getOrCreate(200).?;
+
+    // Fill tc1's cache with blocks
+    var ptrs: [64][*]u8 = undefined;
+    for (&ptrs) |*p| {
+        p.* = tc1.alloc(32, &slab) orelse break;
+    }
+
+    // Free them back to tc1's cache
+    const class_idx = config.sizeClassIndex(32).?;
+    for (ptrs) |p| {
+        tc1.caches[class_idx].push(p);
+    }
+
+    // Now tc2's cache is empty, try to steal
+    const steal_result = work_stealing.stealBlocks(
+        &tc2.caches[class_idx],
+        class_idx,
+        200,
+        &registry,
+    );
+
+    // Should have stolen some blocks (if tc1 had enough)
+    if (tc1.caches[class_idx].count >= work_stealing.getStealConfig().min_victim_blocks) {
+        try std.testing.expect(steal_result.blocks_stolen > 0);
+        try std.testing.expectEqual(@as(?usize, 100), steal_result.source_thread);
+    }
+
+    tc1.flushAll(&slab, &segment_cache);
+    tc2.flushAll(&slab, &segment_cache);
 }

@@ -27,10 +27,45 @@ pub const MEDIUM_THRESHOLD: usize = 32 * 1024; // Max size for page allocation
 pub const LARGE_THRESHOLD: usize = SMALL_THRESHOLD; // Legacy alias
 pub const HUGE_THRESHOLD: usize = SEGMENT_SIZE; // Above this = direct mmap
 
-// Thread cache configuration
+// Thread cache configuration (defaults)
 pub const THREAD_CACHE_MAX_BLOCKS: usize = 256; // Max blocks per size class in thread cache
 pub const THREAD_CACHE_FILL_COUNT: usize = 32; // Blocks to fill from heap at once
 pub const THREAD_CACHE_MAX_PAGES: usize = 4; // Max pages in per-thread page pool
+
+// Runtime-configurable thread cache settings
+pub const ThreadCacheConfig = struct {
+    // Maximum blocks per size class in thread cache
+    max_blocks: usize = THREAD_CACHE_MAX_BLOCKS,
+
+    // Blocks to fill from heap at once when cache is empty
+    fill_count: usize = THREAD_CACHE_FILL_COUNT,
+
+    // Maximum pages in per-thread page pool
+    max_pages: usize = THREAD_CACHE_MAX_PAGES,
+
+    // Enable work stealing from other thread caches
+    work_stealing_enabled: bool = true,
+
+    // Flush cache when thread exits
+    flush_on_exit: bool = true,
+
+    // Low watermark: refill when below this fraction (0.0-1.0)
+    low_watermark: f32 = 0.25,
+
+    // High watermark: flush when above this fraction (0.0-1.0)
+    high_watermark: f32 = 0.75,
+};
+
+// Global runtime configuration
+var global_thread_cache_config: ThreadCacheConfig = .{};
+
+pub fn getThreadCacheConfig() *ThreadCacheConfig {
+    return &global_thread_cache_config;
+}
+
+pub fn setThreadCacheConfig(cfg: ThreadCacheConfig) void {
+    global_thread_cache_config = cfg;
+}
 
 // Segment cache configuration
 pub const SEGMENT_CACHE_MAX: usize = 4; // Max cached free segments
