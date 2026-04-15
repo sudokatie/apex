@@ -18,6 +18,7 @@ pub const thread_cache = @import("thread_cache.zig");
 pub const heap = @import("heap.zig");
 pub const arena = @import("arena.zig");
 pub const stats = @import("stats.zig");
+pub const profiling = @import("profiling.zig");
 
 // C ABI wrapper
 pub const cabi = @import("cabi.zig");
@@ -182,6 +183,21 @@ pub fn disableProfiling() void {
 /// Check if profiling is enabled
 pub fn isProfilingEnabled() bool {
     return platform.isProfilingEnabled();
+}
+
+// ============= Allocation Profiler Interface =============
+
+/// Global profiler instance for allocation tracking
+pub var global_profiler: profiling.Profiler = undefined;
+
+/// Initialize the global allocation profiler
+pub fn initProfiler(allocator: std.mem.Allocator) void {
+    global_profiler = profiling.Profiler.init(allocator);
+}
+
+/// Deinitialize the global allocation profiler
+pub fn deinitProfiler() void {
+    global_profiler.deinit();
 }
 
 // ============= Initialization =============
